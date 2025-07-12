@@ -7,7 +7,7 @@
 # All resizing operations use the high-quality Lanczos filter.
 #
 # Author: slivik
-# Version: 1.3.1 (Ensured Lanczos resampling for all operations)
+# Version: 1.4.0 (Fixed padding logic to correctly upscale small images)
 #
 
 import torch
@@ -42,6 +42,8 @@ class SmartResizer:
     CATEGORY = "slikvik/Image"
 
     def process(self, image: torch.Tensor, resolution_preset: str, pad_image: bool):
+        # The first dimension is the batch size, which we don't need for logic
+        # but we need to handle it in the loop.
         _, original_height, original_width, _ = image.shape
 
         # --- 1. Determine if the image is "Square-ish" ---
@@ -65,17 +67,17 @@ class SmartResizer:
             if is_square_ish:
                 target_width, target_height = 512, 512
             else:
-                if original_width < original_height:
+                if original_width < original_height: # Portrait
                     target_width, target_height = 480, 852
-                else:
+                else: # Landscape
                     target_width, target_height = 852, 480
         elif resolution_preset == "720p":
             if is_square_ish:
                 target_width, target_height = 768, 768
             else:
-                if original_width < original_height:
+                if original_width < original_height: # Portrait
                     target_width, target_height = 720, 1280
-                else:
+                else: # Landscape
                     target_width, target_height = 1280, 720
                     
         print(f"SmartResizer: Mode: {'Pad' if pad_image else 'Crop'}, Target: {target_width}x{target_height}, Resampling: Lanczos")
@@ -83,27 +85,53 @@ class SmartResizer:
         # --- 3. Process the batch of images ---
         processed_images = []
         for img_tensor in image:
+            # Note: The original_width/height from the tensor shape is for the whole batch.
+            # For robustness, we get dimensions from each individual PIL image.
             pil_img = Image.fromarray(np.clip(255. * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8))
+            img_width, img_height = pil_img.size
             
             final_pil_img = None
             if pad_image:
-                # --- MANUAL PADDING LOGIC ---
-                img_copy = pil_img.copy()
-                # Ensure thumbnail resizing uses the specified Lanczos filter.
-                img_copy.thumbnail((target_width, target_height), self.RESAMPLING_METHOD)
+                # --- CORRECTED PADDING LOGIC ---
+                # This logic correctly scales the image up or down to fit within
+                # the target dimensions while maintaining aspect ratio.
+                
+                # 1. Calculate the resize ratio
+                original_aspect_ratio = img_width / img_height if img_height != 0 else 1
+                target_aspect_ratio = target_width / target_height if target_height != 0 else 1
+
+                if original_aspect_ratio > target_aspect_ratio:
+                    # Original is wider than target: fit to target_width
+                    scaled_width = target_width
+                    scaled_height = int(target_width / original_aspect_ratio)
+                else:
+                    # Original is taller than or same as target: fit to target_height
+                    scaled_height = target_height
+                    scaled_width = int(target_height * original_aspect_ratio)
+
+                # 2. Resize the image using the calculated dimensions and high-quality filter
+                resized_img = pil_img.resize((scaled_width, scaled_height), self.RESAMPLING_METHOD)
+                
+                # 3. Create a new black background
                 background = Image.new('RGB', (target_width, target_height), (0, 0, 0))
-                paste_x = (target_width - img_copy.width) // 2
-                paste_y = (target_height - img_copy.height) // 2
-                background.paste(img_copy, (paste_x, paste_y))
+                
+                # 4. Calculate coordinates to paste the resized image in the center
+                paste_x = (target_width - scaled_width) // 2
+                paste_y = (target_height - scaled_height) // 2
+                
+                # 5. Paste the image
+                background.paste(resized_img, (paste_x, paste_y))
                 final_pil_img = background
             else:
                 # --- MANUAL CROPPING LOGIC ---
-                if original_width / original_height > target_width / target_height:
+                # This logic scales to fill the target, then crops the excess.
+                # It already handles upscaling correctly.
+                if img_width / img_height > target_width / target_height:
                     new_height = target_height
-                    new_width = int(original_width * (target_height / original_height))
+                    new_width = int(img_width * (target_height / img_height))
                 else:
                     new_width = target_width
-                    new_height = int(original_height * (target_width / original_width))
+                    new_height = int(img_height * (target_width / img_width))
                 
                 # Ensure the main resize operation uses the specified Lanczos filter.
                 resized_img = pil_img.resize((new_width, new_height), self.RESAMPLING_METHOD)
